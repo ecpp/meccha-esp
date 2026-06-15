@@ -888,17 +888,13 @@ class Overlay(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(10, 20, f"Players: {count}")
 
-    def _project_dot(self, feet_pos, camera, screen_w, screen_h):
-        head_pos = (feet_pos[0], feet_pos[1], feet_pos[2] + self.config.box_height_world)
-        s_feet = w2s(feet_pos, camera, screen_w, screen_h)
-        s_head = w2s(head_pos, camera, screen_w, screen_h)
-        if not s_feet or not s_head:
+    def _project_dot(self, center_pos, camera, screen_w, screen_h):
+        # The actor's RootComponent relative location is already the capsule center,
+        # so project it directly instead of guessing from feet/head.
+        s = w2s(center_pos, camera, screen_w, screen_h)
+        if not s:
             return None
-
-        # Center of the player model in screen space.
-        cx = s_feet[0]
-        cy = (s_feet[1] + s_head[1]) / 2 + self.config.box_y_offset
-        return (cx, cy)
+        return (s[0], s[1] + self.config.box_y_offset)
 
     def _draw_dot(self, painter, cx, cy, color):
         r = self.config.dot_radius
