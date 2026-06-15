@@ -154,6 +154,8 @@ def dist(a, b):
 # Pattern scanner
 # ---------------------------------------------------------------------------
 class PatternScanner:
+    CHUNK_SIZE = 0x200000  # 2 MiB chunks to avoid huge allocations on shipping exes
+
     def __init__(self, pm, module_name):
         self.pm = pm
         self.module = pymem.process.module_from_name(pm.process_handle, module_name)
@@ -162,17 +164,35 @@ class PatternScanner:
         self.base = self.module.lpBaseOfDll
         self.size = self.module.SizeOfImage
 
-    def scan(self, pattern, mask):
-        data = self.pm.read_bytes(self.base, self.size)
+    def _match_at(self, data, offset, pattern, mask):
         pat_len = len(pattern)
-        for i in range(self.size - pat_len):
-            matched = True
-            for j in range(pat_len):
-                if mask[j] and data[i + j] != pattern[j]:
-                    matched = False
-                    break
-            if matched:
-                return self.base + i
+        for j in range(pat_len):
+            if mask[j] and data[offset + j] != pattern[j]:
+                return False
+        return True
+
+    def scan_all(self, pattern, mask):
+        """Yield every match address in ascending order."""
+        pat_len = len(pattern)
+        if pat_len == 0 or self.size == 0:
+            return
+        step = self.CHUNK_SIZE
+        for start in range(0, self.size, step):
+            # Overlap reads by pat_len so patterns spanning chunk boundaries aren't missed.
+            end = min(start + step + pat_len, self.size)
+            read_size = end - start
+            try:
+                data = self.pm.read_bytes(self.base + start, read_size)
+            except Exception:
+                continue
+            scan_len = len(data) - pat_len
+            for i in range(scan_len):
+                if self._match_at(data, i, pattern, mask):
+                    yield self.base + start + i
+
+    def scan(self, pattern, mask):
+        for addr in self.scan_all(pattern, mask):
+            return addr
         return 0
 
 
@@ -180,30 +200,78 @@ class PatternScanner:
 # FName + object array
 # ---------------------------------------------------------------------------
 class FNameResolver:
+    # FNamePool block-pointer tables sit at different offsets depending on UE5 version.
+    BLOCK_TABLE_OFFSETS = (0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
+                           0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70)
+
     def __init__(self, pm, fname_pool):
         self.pm = pm
         self.fname_pool = fname_pool
+        self.block_table_off = 0x10
+        self.header_style = "ue5"  # or "ue4"
+        self._detect_layout()
+
+    def _read_entry(self, entry_id, table_off, style):
+        block_idx = entry_id >> 16
+        within = (entry_id & 0xFFFF) << 1
+        block_addr = rp(self.pm, self.fname_pool + table_off + block_idx * 8)
+        if not block_addr:
+            return None
+        hdr = ru16(self.pm, block_addr + within)
+        if style == "ue4":
+            # UE4: bIsWide (1 bit), Len (15 bits)
+            is_wide = hdr & 1
+            length = hdr >> 1
+        elif style == "custom":
+            # MECCHA CHAMELEON build: bIsWide (bit 0), Len (bits 6-15)
+            is_wide = hdr & 1
+            length = (hdr >> 6) & 0x3FF
+        else:
+            # Standard UE5: Len (10 bits), bIsWide (1 bit), LowercaseProbeHash (5 bits)
+            length = hdr & 0x3FF
+            is_wide = (hdr >> 10) & 1
+        if length == 0 or length > 512:
+            return None
+        if is_wide:
+            raw = self.pm.read_bytes(block_addr + within + 2, length * 2)
+            return raw.decode("utf-16-le", errors="ignore")
+        else:
+            raw = self.pm.read_bytes(block_addr + within + 2, length)
+            return raw.decode("latin-1")
+
+    def _detect_layout(self):
+        """Probe block-table offsets and header styles until entry 0 is 'None'."""
+        for off in self.BLOCK_TABLE_OFFSETS:
+            for style in ("custom", "ue5", "ue4"):
+                try:
+                    if self._read_entry(0, off, style) == "None":
+                        self.block_table_off = off
+                        self.header_style = style
+                        return
+                except Exception:
+                    continue
 
     def resolve(self, entry_id):
         try:
-            block_idx = entry_id >> 16
-            within = (entry_id & 0xFFFF) << 1
-            block_addr = rp(self.pm, self.fname_pool + 0x10 + block_idx * 8)
-            if not block_addr:
-                return None
-            hdr = ru16(self.pm, block_addr + within)
-            is_wide = hdr & 1
-            length = hdr >> 6
-            if length == 0 or length > 256:
-                return None
-            if is_wide:
-                raw = self.pm.read_bytes(block_addr + within + 2, length * 2)
-                return raw.decode("utf-16-le", errors="ignore")
-            else:
-                raw = self.pm.read_bytes(block_addr + within + 2, length)
-                return raw.decode("latin-1")
+            name = self._read_entry(entry_id, self.block_table_off, self.header_style)
+            if name is not None:
+                return name
         except Exception:
-            return None
+            pass
+        # If the cached layout fails, re-probe once per call until something works.
+        for off in self.BLOCK_TABLE_OFFSETS:
+            for style in ("custom", "ue5", "ue4"):
+                if off == self.block_table_off and style == self.header_style:
+                    continue
+                try:
+                    name = self._read_entry(entry_id, off, style)
+                    if name is not None:
+                        self.block_table_off = off
+                        self.header_style = style
+                        return name
+                except Exception:
+                    continue
+        return None
 
 
 class UObjectArray:
@@ -236,7 +304,8 @@ class UObjectArray:
             chunk_idx += 1
 
     def _meta_class(self):
-        if self._meta_class_addr is None:
+        # Don't cache a failed search; the object array may still be loading.
+        if self._meta_class_addr is None or not self._meta_class_addr:
             for obj in self.iter_objects():
                 if self._obj_name(obj) == "Class":
                     self._meta_class_addr = obj
@@ -244,8 +313,12 @@ class UObjectArray:
         return self._meta_class_addr
 
     def find_class(self, name):
-        if name in self._class_cache:
-            return self._class_cache[name]
+        cached = self._class_cache.get(name)
+        if cached:
+            # Validate the cached pointer still names itself correctly.
+            if self._obj_name(cached) == name:
+                return cached
+            del self._class_cache[name]
         meta = self._meta_class()
         if not meta:
             return 0
@@ -280,6 +353,26 @@ class MecchaESP:
         0x48, 0x89, 0x01, 0x45, 0x8B, 0xD1
     ])
     GUOBJECT_MASK = bytes([1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1])
+
+    # Multiple FNamePool references can appear; we verify by trying to read names.
+    FNAMEPOOL_PATTERNS = (
+        # lea rcx,[FNamePool]; call FName::FName; mov r8,rax
+        (bytes([0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+                0x4C, 0x8B, 0xC0]),
+         bytes([1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1])),
+        # lea rcx,[FNamePool]; call FName::FName; mov rax,[rbx+...]
+        (bytes([0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+                0x48, 0x8B]),
+         bytes([1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1])),
+        # lea rsi,[FNamePool]
+        (bytes([0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]),
+         bytes([1, 1, 1, 0, 0, 0, 0])),
+        # lea rdi,[FNamePool]
+        (bytes([0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
+         bytes([1, 1, 1, 0, 0, 0, 0])),
+    )
     FNAMEPOOL_DELTA = 0xE3B40
 
     OFFSET_MAP = {
@@ -297,6 +390,8 @@ class MecchaESP:
         "APlayerCameraManager::CameraCachePrivate": ("PlayerCameraManager", "CameraCachePrivate"),
         "AActor::RootComponent": ("Actor", "RootComponent"),
         "USceneComponent::RelativeLocation": ("SceneComponent", "RelativeLocation"),
+        # Note: UWorld::PersistentLevel and ULevel::Actors are only used in the
+        # level-actors fallback; they are resolved lazily with hardcoded defaults.
     }
 
     def __init__(self):
@@ -304,8 +399,12 @@ class MecchaESP:
         self.guobject_array = self._scan_guobject_array()
         if not self.guobject_array:
             raise RuntimeError("Could not find GUObjectArray via pattern scan")
-        self.fname_pool = self.guobject_array - self.FNAMEPOOL_DELTA
+        self.fname_pool = self._scan_fname_pool()
+        if not self.fname_pool:
+            raise RuntimeError("Could not find FNamePool via pattern scan or delta fallback")
         self.objects = UObjectArray(self.pm, self.guobject_array, self.fname_pool)
+        # Sanity-check globals; on failure we still open, but warn in overlay.
+        self._globals_ok = self._verify_globals()
         self.resolver = OffsetResolver(self.pm, self.objects)
         self.offsets = self.resolver.resolve_map(self.OFFSET_MAP)
         # Fill in the stable nested struct offsets from the bootstrap dict.
@@ -323,6 +422,44 @@ class MecchaESP:
             return 0
         rel = struct.unpack("<i", self.pm.read_bytes(addr + 3, 4))[0]
         return addr + 7 + rel
+
+    def _scan_fname_pool(self):
+        # The delta has been stable for this build; use it as the default.
+        delta_candidate = self.guobject_array - self.FNAMEPOOL_DELTA
+        if self._verify_fname_pool(delta_candidate):
+            return delta_candidate
+        # Try a few common FNamePool signatures as backups.
+        scanner = PatternScanner(self.pm, self.MODULE_NAME)
+        for sig, mask in self.FNAMEPOOL_PATTERNS:
+            for addr in scanner.scan_all(sig, mask):
+                rel = struct.unpack("<i", self.pm.read_bytes(addr + 3, 4))[0]
+                candidate = addr + 7 + rel
+                if self._verify_fname_pool(candidate):
+                    return candidate
+        # Even if unverified, fall back to the delta so the ESP can still open.
+        # Name resolution may self-correct via the resolver's lazy offset probe.
+        return delta_candidate
+
+    def _verify_fname_pool(self, pool_addr):
+        resolver = FNameResolver(self.pm, pool_addr)
+        if resolver.resolve(0) == "None":
+            return True
+        # Some builds don't keep "None" at id 0; settle for any printable name.
+        for probe in (0, 1, 2, 3, 4, 5):
+            name = resolver.resolve(probe)
+            if name and 0 < len(name) <= 128 and name.isprintable():
+                return True
+        return False
+
+    def _verify_globals(self):
+        # GUObjectArray + 0x10 is TUObjectArray::Objects; read its header.
+        obj_array = self.guobject_array + 0x10
+        num = ru32(self.pm, obj_array + 0x14)
+        max_chunks = ru32(self.pm, obj_array + 0x18)
+        if num == 0 or num > 10_000_000 or max_chunks == 0 or max_chunks > 64:
+            return False
+        # We should be able to find the meta Class object.
+        return self.objects.find_class("Class") != 0
 
     def _get_world(self):
         viewport = rp(self.pm, self.gengine + self.offsets["UEngine::GameViewport"])
@@ -372,8 +509,6 @@ class MecchaESP:
         if not world:
             return
         gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
-        if not gamestate:
-            return
         pc = self._get_local_controller(world)
         local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
         local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
@@ -385,29 +520,59 @@ class MecchaESP:
                 pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
                 yield True, pos, 0
 
-        pa_data, pa_count, _ = read_array(self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"])
-        if not pa_data or pa_count == 0:
-            return
-        for i in range(pa_count):
-            ps = rp(self.pm, pa_data + i * 8)
-            if not ps or ps == local_ps:
-                continue
-            pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
-            if not pawn or pawn == local_pawn:
-                continue
-            pawn_cls = self._class_name(pawn)
-            if not pawn_cls:
-                continue
-            if team_filter and local_pawn_cls:
-                if pawn_cls == local_pawn_cls:
-                    continue
-                if "Spectate" in pawn_cls:
-                    continue
-            root = rp(self.pm, pawn + self.offsets["AActor::RootComponent"])
-            if not root:
-                continue
-            pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
-            yield False, pos, i
+        yielded = 0
+        if gamestate:
+            pa_data, pa_count, _ = read_array(self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"])
+            if pa_data and pa_count > 0:
+                for i in range(pa_count):
+                    ps = rp(self.pm, pa_data + i * 8)
+                    if not ps or ps == local_ps:
+                        continue
+                    pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
+                    if not pawn or pawn == local_pawn:
+                        continue
+                    pawn_cls = self._class_name(pawn)
+                    if not pawn_cls:
+                        continue
+                    if team_filter and local_pawn_cls:
+                        # If every player uses the same pawn class, filtering by exact class
+                        # would hide everyone. That case is recovered by the level-actor fallback.
+                        if pawn_cls == local_pawn_cls:
+                            continue
+                        if "Spectate" in pawn_cls:
+                            continue
+                    root = rp(self.pm, pawn + self.offsets["AActor::RootComponent"])
+                    if not root:
+                        continue
+                    pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
+                    yielded += 1
+                    yield False, pos, i
+
+        # Fallback: if the PlayerArray path produced nothing (empty array, unresolved
+        # offsets, or team-filter hid every candidate), walk the persistent level actors.
+        if yielded == 0:
+            persistent_level_off = self.resolver.resolve("World", "PersistentLevel") if hasattr(self, "resolver") else None
+            if persistent_level_off is None:
+                persistent_level_off = 0x30
+            level = rp(self.pm, world + persistent_level_off)
+            if level:
+                actors_off = self.resolver.resolve("Level", "Actors") if hasattr(self, "resolver") else None
+                if actors_off is None:
+                    actors_off = 0x98
+                actors_data, actors_count, _ = read_array(self.pm, level + actors_off)
+                if actors_data and actors_count > 0:
+                    for i in range(actors_count):
+                        actor = rp(self.pm, actors_data + i * 8)
+                        if not actor or actor == local_pawn:
+                            continue
+                        cls_name = self._class_name(actor)
+                        if not cls_name or "Character" not in cls_name:
+                            continue
+                        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
+                        if not root:
+                            continue
+                        pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
+                        yield False, pos, i
 
 
 # ---------------------------------------------------------------------------
