@@ -144,6 +144,14 @@ def rvec3(pm, addr):
         return (0.0, 0.0, 0.0)
 
 
+def rrot(pm, addr):
+    """Read an FRotator (Pitch/Yaw/Roll as floats, 12 bytes)."""
+    try:
+        return struct.unpack("<fff", pm.read_bytes(addr, 12))
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
 def read_array(pm, addr):
     try:
         data = rp(pm, addr)
@@ -490,6 +498,14 @@ class MecchaESP:
             return 0
         return rp(self.pm, local_player + self.offsets["UPlayer::PlayerController"])
 
+    def _read_pov(self, pov_addr):
+        """Read a minimal view POV from the given address."""
+        return {
+            "loc": rvec3(self.pm, pov_addr + self.offsets["FMinimalViewInfo::Location"]),
+            "rot": rvec3(self.pm, pov_addr + self.offsets["FMinimalViewInfo::Rotation"]),
+            "fov": rfloat(self.pm, pov_addr + self.offsets["FMinimalViewInfo::FOV"]),
+        }
+
     def get_camera(self):
         world = self._get_world()
         if not world:
@@ -500,12 +516,32 @@ class MecchaESP:
         cam = rp(self.pm, pc + self.offsets["APlayerController::PlayerCameraManager"])
         if not cam:
             return None
+
+        # Primary: CameraCachePrivate (always reflects the current camera).
         cc = cam + self.offsets["APlayerCameraManager::CameraCachePrivate"]
         pov = cc + self.offsets["FCameraCacheEntry::POV"]
-        loc = rvec3(self.pm, pov + self.offsets["FMinimalViewInfo::Location"])
-        rot = rvec3(self.pm, pov + self.offsets["FMinimalViewInfo::Rotation"])
-        fov = rfloat(self.pm, pov + self.offsets["FMinimalViewInfo::FOV"])
-        return {"loc": loc, "rot": rot, "fov": fov}
+        try:
+            camera = self._read_pov(pov)
+        except Exception:
+            camera = None
+
+        # Fallback: PlayerCameraManager->ViewTarget.POV (some spectate/free-look modes).
+        if (camera is None or
+            (abs(camera["loc"][0]) < 0.01 and abs(camera["loc"][1]) < 0.01 and abs(camera["loc"][2]) < 0.01) or
+            camera["fov"] <= 0.0):
+            vt_off = self.offsets.get("APlayerCameraManager::ViewTarget")
+            vt_pov_off = self.offsets.get("FTViewTarget::POV")
+            if vt_off is not None and vt_pov_off is not None:
+                try:
+                    fallback = self._read_pov(cam + vt_off + vt_pov_off)
+                    if fallback["fov"] > 0.0:
+                        camera = fallback
+                except Exception:
+                    pass
+
+        if camera is None or camera["fov"] <= 0.0:
+            return None
+        return camera
 
     def _class_name(self, obj):
         if not obj:
@@ -513,9 +549,84 @@ class MecchaESP:
         cls = rp(self.pm, obj + OFFSETS["UObjectBase::ClassPrivate"])
         return self.objects._obj_name(cls) if cls else ""
 
-    def iter_players(self, include_local=False, team_filter=False):
+    def _pawn_controller(self, pawn):
+        if not pawn:
+            return 0
+        off = self.offsets.get("APawn::Controller")
+        if off is None:
+            return 0
+        return rp(self.pm, pawn + off)
+
+    def _pawn_playerstate(self, pawn):
+        if not pawn:
+            return 0
+        off = self.offsets.get("APawn::PlayerState")
+        if off is None:
+            return 0
+        return rp(self.pm, pawn + off)
+
+    def _actor_owner(self, actor):
+        if not actor:
+            return 0
+        off = self.offsets.get("AActor::Owner")
+        if off is None:
+            return 0
+        return rp(self.pm, actor + off)
+
+    def _component_world_pos(self, component):
+        """Read a USceneComponent's world translation from ComponentToWorld."""
+        if not component:
+            return None
+        ctw_off = self.offsets.get("USceneComponent::ComponentToWorld")
+        trans_off = self.offsets.get("FTransform::Translation")
+        if ctw_off is None or trans_off is None:
+            return None
+        try:
+            return rvec3(self.pm, component + ctw_off + trans_off)
+        except Exception:
+            return None
+
+    def _actor_position(self, actor):
+        """Return the best available world position for an actor.
+
+        The old RelativeLocation path was working for this game, so it stays
+        primary. ComponentToWorld is only used as a fallback if RelativeLocation
+        is missing or clearly uninitialized.
+        """
+        if not actor:
+            return None
+        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
+        if root:
+            rel_off = self.offsets.get("USceneComponent::RelativeLocation")
+            if rel_off is not None:
+                try:
+                    pos = rvec3(self.pm, root + rel_off)
+                    # Only fall through to ComponentToWorld if RelativeLocation
+                    # is clearly uninitialized (origin-only).
+                    if not (abs(pos[0]) < 0.01 and abs(pos[1]) < 0.01 and abs(pos[2]) < 0.01):
+                        return pos
+                except Exception:
+                    pass
+            # Fallback: world-space transform.
+            pos = self._component_world_pos(root)
+            if pos is not None:
+                return pos
+        # Last resort: mesh world transform.
+        mesh_off = self.offsets.get("ACharacter::Mesh")
+        if mesh_off is not None:
+            mesh = rp(self.pm, actor + mesh_off)
+            if mesh:
+                pos = self._component_world_pos(mesh)
+                if pos is not None:
+                    return pos
+        return None
+
+    def iter_players(self, include_local=False, team_filter=False, show_all_chars=False):
         world = self._get_world()
         if not world:
+            self._last_iter_stats = {"pa_total": 0, "pa_valid": 0,
+                                     "level_total": 0, "level_valid": 0,
+                                     "rendered": 0}
             return
         gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
         pc = self._get_local_controller(world)
@@ -523,65 +634,97 @@ class MecchaESP:
         local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
         local_pawn_cls = self._class_name(local_pawn)
 
+        # Class-based team filtering is unreliable when AcknowledgedPawn is a
+        # spectated target (free-look / deathcam). Detect that by class name and
+        # disable the filter instead of reading risky pawn controller offsets.
+        spectating = bool(local_pawn and "Spectate" in local_pawn_cls)
+        team_filter_active = team_filter and not spectating and not show_all_chars
+
+        stats = {"pa_total": 0, "pa_valid": 0,
+                 "level_total": 0, "level_valid": 0,
+                 "rendered": 0}
+        seen = set()
+
+        # Local marker for calibration.
         if include_local and local_pawn:
-            root = rp(self.pm, local_pawn + self.offsets["AActor::RootComponent"])
-            if root:
-                pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
+            pos = self._actor_position(local_pawn)
+            if pos is not None:
+                stats["rendered"] += 1
                 yield True, pos, 0
 
+        def _is_valid_target(pawn):
+            if not pawn:
+                return False
+            cls_name = self._class_name(pawn)
+            if not cls_name:
+                return False
+            # Emergency bypass: draw every live character and let the user sort it out.
+            if show_all_chars:
+                return "Character" in cls_name and "Spectate" not in cls_name
+            if "Spectate" in cls_name:
+                return False
+            # Class-based team filter.
+            if team_filter_active and local_pawn_cls:
+                if cls_name == local_pawn_cls:
+                    return False
+            return True
+
+        def _emit_actor(actor, idx, stat_key):
+            pos = self._actor_position(actor)
+            if pos is None:
+                return
+            # Drop uninitialized / origin-only positions.
+            if abs(pos[0]) < 0.01 and abs(pos[1]) < 0.01 and abs(pos[2]) < 0.01:
+                return
+            stats[stat_key] += 1
+            stats["rendered"] += 1
+            yield False, pos, idx
+
+        # Pass 1: GameState->PlayerArray.
         yielded = 0
         if gamestate:
             pa_data, pa_count, _ = read_array(self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"])
+            stats["pa_total"] = pa_count
             if pa_data and pa_count > 0:
                 for i in range(pa_count):
                     ps = rp(self.pm, pa_data + i * 8)
                     if not ps or ps == local_ps:
                         continue
                     pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
-                    if not pawn or pawn == local_pawn:
+                    if not pawn or pawn == local_pawn or pawn in seen:
                         continue
                     pawn_cls = self._class_name(pawn)
                     if not pawn_cls:
                         continue
-                    if team_filter and local_pawn_cls:
-                        # If every player uses the same pawn class, filtering by exact class
-                        # would hide everyone. That case is recovered by the level-actor fallback.
-                        if pawn_cls == local_pawn_cls:
-                            continue
-                        if "Spectate" in pawn_cls:
-                            continue
-                    root = rp(self.pm, pawn + self.offsets["AActor::RootComponent"])
-                    if not root:
+                    seen.add(pawn)
+                    if not _is_valid_target(pawn):
                         continue
-                    pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
+                    yield from _emit_actor(pawn, i, "pa_valid")
                     yielded += 1
-                    yield False, pos, i
 
-        # Fallback: if the PlayerArray path produced nothing (empty array, unresolved
-        # offsets, or team-filter hid every candidate), walk the persistent level actors.
-        if yielded == 0:
-            persistent_level_off = self.resolver.resolve("World", "PersistentLevel") if hasattr(self, "resolver") else None
-            if persistent_level_off is None:
-                persistent_level_off = 0x30
+        # Pass 2: Persistent level actors (fallback / merge).
+        # Only scan if PlayerArray produced nothing, or if the user wants all chars.
+        if yielded == 0 or show_all_chars:
+            persistent_level_off = self.offsets.get("UWorld::PersistentLevel", 0x30)
             level = rp(self.pm, world + persistent_level_off)
             if level:
-                actors_off = self.resolver.resolve("Level", "Actors") if hasattr(self, "resolver") else None
-                if actors_off is None:
-                    actors_off = 0x98
+                actors_off = self.offsets.get("ULevel::Actors", 0xA0)
                 actors_data, actors_count, _ = read_array(self.pm, level + actors_off)
-                if actors_data and actors_count > 0:
+                stats["level_total"] = actors_count
+                if actors_data and actors_count > 0 and actors_count < 10000:
                     for i in range(actors_count):
                         actor = rp(self.pm, actors_data + i * 8)
-                        if not actor or actor == local_pawn:
+                        if not actor or actor == local_pawn or actor in seen:
                             continue
                         cls_name = self._class_name(actor)
                         if not cls_name or "Character" not in cls_name:
                             continue
-                        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
-                        if not root:
+                        seen.add(actor)
+                        if not _is_valid_target(actor):
                             continue
-                        pos = rvec3(self.pm, root + self.offsets["USceneComponent::RelativeLocation"])
-                        yield False, pos, i
+                        yield from _emit_actor(actor, i, "level_valid")
+
+        self._last_iter_stats = stats
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +791,8 @@ class Config:
     box_y_offset: int = 0
     dot_radius: int = 8
     team_filter: bool = True
+    show_debug: bool = False
+    show_all_chars: bool = False
 
     # Aimbot
     aimbot_enabled: bool = False
@@ -671,7 +816,7 @@ class Menu(QWidget):
         self._drag_pos = None
 
         self._build_ui()
-        self.setFixedSize(260, 620)
+        self.setFixedSize(260, 640)
 
     def _build_ui(self):
         container = QFrame(self)
@@ -727,6 +872,8 @@ class Menu(QWidget):
         self.cb_dist = self._chk("Show Distance", "show_distance")
         self.cb_snap = self._chk("Snap Lines", "snap_lines")
         self.cb_team = self._chk("Team Filter (Hunters)", "team_filter")
+        self.cb_debug = self._chk("Show Debug Counters", "show_debug")
+        self.cb_all_chars = self._chk("Show ALL Characters", "show_all_chars")
         layout.addWidget(self.cb_enabled)
         layout.addWidget(self.cb_box)
         layout.addWidget(self.cb_local)
@@ -734,6 +881,8 @@ class Menu(QWidget):
         layout.addWidget(self.cb_dist)
         layout.addWidget(self.cb_snap)
         layout.addWidget(self.cb_team)
+        layout.addWidget(self.cb_debug)
+        layout.addWidget(self.cb_all_chars)
 
         dot_row = QHBoxLayout()
         dot_row.addWidget(QLabel("Dot Radius:"))
@@ -977,7 +1126,10 @@ class Overlay(QWidget):
             return
 
         count = 0
-        for is_local, pos, idx in self.esp.iter_players(include_local=self.config.show_local, team_filter=self.config.team_filter):
+        for is_local, pos, idx in self.esp.iter_players(
+                include_local=self.config.show_local,
+                team_filter=self.config.team_filter,
+                show_all_chars=self.config.show_all_chars):
             screen_info = self._project_dot(pos, cam, w, h)
             if not screen_info:
                 continue
@@ -1006,6 +1158,11 @@ class Overlay(QWidget):
 
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(10, 20, f"Players: {count}")
+        if self.config.show_debug:
+            stats = getattr(self.esp, "_last_iter_stats", {})
+            line = (f"PA:{stats.get('pa_total', 0)}/{stats.get('pa_valid', 0)} "
+                    f"LA:{stats.get('level_total', 0)}/{stats.get('level_valid', 0)}")
+            painter.drawText(10, 35, line)
 
         # ------------------------------------------------------------------
         # Aimbot
@@ -1021,7 +1178,10 @@ class Overlay(QWidget):
                                     self.config.aimbot_fov * 2)
 
             best_target = self._find_best_target(cam, w, h)
-            if best_target and self._aim_key_held():
+            key_held = self._aim_key_held()
+            if self.config.show_debug:
+                print(f"[AIM-DEBUG] key_held={key_held} best_target={best_target}")
+            if best_target and key_held:
                 self._aim_at(best_target)
 
     def _project_dot(self, center_pos, camera, screen_w, screen_h):
@@ -1066,7 +1226,10 @@ class Overlay(QWidget):
 
     def _aim_key_held(self):
         vk = self.AIM_KEY_VK.get(self.config.aimbot_key, 0x06)
-        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        held = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        if self.config.show_debug:
+            print(f"[AIM-DEBUG] aim_key='{self.config.aimbot_key}' vk={hex(vk)} held={held}")
+        return held
 
     def _find_best_target(self, camera, screen_w, screen_h):
         # Extra self-filter: iter_players should skip local, but if local controller
@@ -1075,17 +1238,17 @@ class Overlay(QWidget):
         world = self.esp._get_world()
         local_pc = self.esp._get_local_controller(world) if world else 0
         local_pawn = rp(self.esp.pm, local_pc + self.esp.offsets["APlayerController::AcknowledgedPawn"]) if local_pc else 0
-        local_pos = None
-        if local_pawn:
-            root = rp(self.esp.pm, local_pawn + self.esp.offsets["AActor::RootComponent"])
-            if root:
-                local_pos = rvec3(self.esp.pm, root + self.esp.offsets["USceneComponent::RelativeLocation"])
+        local_pos = self.esp._actor_position(local_pawn) if local_pawn else None
 
         cx, cy = screen_w / 2, screen_h / 2
         cam_loc = camera["loc"]
         best_dist = float("inf")
         best_target = None
-        for is_local, pos, idx in self.esp.iter_players(include_local=False, team_filter=self.config.team_filter):
+        count = 0
+        for is_local, pos, idx in self.esp.iter_players(
+                include_local=False,
+                team_filter=self.config.team_filter,
+                show_all_chars=self.config.show_all_chars):
             if is_local:
                 continue
             # Skip self if it leaked through.
@@ -1101,6 +1264,7 @@ class Overlay(QWidget):
                              (pos[2] - cam_loc[2]) ** 2)
             if dcam < 50.0:
                 continue
+            count += 1
 
             aim_pos = (pos[0], pos[1], pos[2] + self.config.aimbot_target_offset)
             s = w2s(aim_pos, camera, screen_w, screen_h)
@@ -1112,6 +1276,8 @@ class Overlay(QWidget):
             if d <= self.config.aimbot_fov and d < best_dist:
                 best_dist = d
                 best_target = aim_pos
+        if self.config.show_debug:
+            print(f"[AIM-DEBUG] candidates={count} best_target={best_target} fov={self.config.aimbot_fov}")
         return best_target
 
     def _vector_to_rotation(self, vec):
@@ -1120,7 +1286,8 @@ class Overlay(QWidget):
         if length == 0:
             return (0.0, 0.0, 0.0)
         x, y, z = x / length, y / length, z / length
-        pitch = math.degrees(math.asin(z))
+        # Pitch sign is flipped for this build — positive looks down, not up.
+        pitch = -math.degrees(math.asin(z))
         yaw = math.degrees(math.atan2(y, x))
         return (pitch, yaw, 0.0)
 
@@ -1132,7 +1299,10 @@ class Overlay(QWidget):
         if not pc:
             return None
         addr = pc + self.esp.offsets["AController::ControlRotation"]
-        return (rfloat(self.esp.pm, addr), rfloat(self.esp.pm, addr + 4), rfloat(self.esp.pm, addr + 8))
+        rot = (rfloat(self.esp.pm, addr), rfloat(self.esp.pm, addr + 4), rfloat(self.esp.pm, addr + 8))
+        if self.config.show_debug:
+            print(f"[AIM-DEBUG] ControlRotation={rot} addr={hex(addr)} pc={hex(pc)}")
+        return rot
 
     def _write_control_rotation(self, rot):
         world = self.esp._get_world()
@@ -1142,10 +1312,12 @@ class Overlay(QWidget):
         if not pc:
             return False
         addr = pc + self.esp.offsets["AController::ControlRotation"]
-        wfloat(self.esp.pm, addr, rot[0])
-        wfloat(self.esp.pm, addr + 4, rot[1])
-        wfloat(self.esp.pm, addr + 8, rot[2])
-        return True
+        ok = (wfloat(self.esp.pm, addr, rot[0]) and
+              wfloat(self.esp.pm, addr + 4, rot[1]) and
+              wfloat(self.esp.pm, addr + 8, rot[2]))
+        if self.config.show_debug:
+            print(f"[AIM-DEBUG] write ControlRotation={rot} ok={ok}")
+        return ok
 
     def _aim_at(self, target_pos):
         cam = self.esp.get_camera()
@@ -1161,6 +1333,8 @@ class Overlay(QWidget):
         smooth = self.config.aimbot_smooth
         new_pitch = current[0] + (target_rot[0] - current[0]) * smooth
         new_yaw = current[1] + (target_rot[1] - current[1]) * smooth
+        if self.config.show_debug:
+            print(f"[AIM-DEBUG] cam_loc={cam['loc']} target_pos={target_pos} current={current} target_rot={target_rot} new=({new_pitch}, {new_yaw})")
         self._write_control_rotation((new_pitch, new_yaw, current[2]))
 
 
