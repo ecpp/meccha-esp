@@ -621,7 +621,7 @@ class MecchaESP:
                     return pos
         return None
 
-    def iter_players(self, include_local=False, team_filter=False, show_all_chars=False):
+    def iter_players(self, include_local=False, players_only=False):
         world = self._get_world()
         if not world:
             self._last_iter_stats = {"pa_total": 0, "pa_valid": 0,
@@ -632,25 +632,11 @@ class MecchaESP:
         pc = self._get_local_controller(world)
         local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
         local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
-        local_pawn_cls = self._class_name(local_pawn)
-
-        # Class-based team filtering is unreliable when AcknowledgedPawn is a
-        # spectated target (free-look / deathcam). Detect that by class name and
-        # disable the filter instead of reading risky pawn controller offsets.
-        spectating = bool(local_pawn and "Spectate" in local_pawn_cls)
-        team_filter_active = team_filter and not spectating and not show_all_chars
 
         stats = {"pa_total": 0, "pa_valid": 0,
                  "level_total": 0, "level_valid": 0,
                  "rendered": 0}
         seen = set()
-
-        # Local marker for calibration.
-        if include_local and local_pawn:
-            pos = self._actor_position(local_pawn)
-            if pos is not None:
-                stats["rendered"] += 1
-                yield True, pos, 0
 
         def _is_valid_target(pawn):
             if not pawn:
@@ -658,16 +644,10 @@ class MecchaESP:
             cls_name = self._class_name(pawn)
             if not cls_name:
                 return False
-            # Emergency bypass: draw every live character and let the user sort it out.
-            if show_all_chars:
-                return "Character" in cls_name and "Spectate" not in cls_name
-            if "Spectate" in cls_name:
-                return False
-            # Class-based team filter.
-            if team_filter_active and local_pawn_cls:
-                if cls_name == local_pawn_cls:
-                    return False
-            return True
+            # Default logic: show every live Character in the world. Team filters
+            # are intentionally gone because they hide players in free-look/spectate
+            # and across game modes where pawn classes overlap.
+            return "Character" in cls_name and "Spectate" not in cls_name
 
         def _emit_actor(actor, idx, stat_key):
             pos = self._actor_position(actor)
@@ -680,7 +660,15 @@ class MecchaESP:
             stats["rendered"] += 1
             yield False, pos, idx
 
-        # Pass 1: GameState->PlayerArray.
+        # Local marker for calibration.
+        if include_local and local_pawn:
+            pos = self._actor_position(local_pawn)
+            if pos is not None:
+                stats["rendered"] += 1
+                yield True, pos, 0
+
+        # Pass 1: GameState->PlayerArray. This is the only source the aimbot uses,
+        # because the level-actor scan can include NPCs/dummies with garbage positions.
         yielded = 0
         if gamestate:
             pa_data, pa_count, _ = read_array(self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"])
@@ -703,8 +691,9 @@ class MecchaESP:
                     yielded += 1
 
         # Pass 2: Persistent level actors (fallback / merge).
-        # Only scan if PlayerArray produced nothing, or if the user wants all chars.
-        if yielded == 0 or show_all_chars:
+        # ESP uses this to catch players PlayerArray hasn't updated yet. The aimbot
+        # intentionally skips it to avoid locking onto random NPCs or dummy pawns.
+        if not players_only:
             persistent_level_off = self.offsets.get("UWorld::PersistentLevel", 0x30)
             level = rp(self.pm, world + persistent_level_off)
             if level:
@@ -790,16 +779,14 @@ class Config:
     box_height_world: float = 100.0
     box_y_offset: int = 0
     dot_radius: int = 8
-    team_filter: bool = True
     show_debug: bool = False
-    show_all_chars: bool = False
 
     # Aimbot
     aimbot_enabled: bool = False
     aimbot_key: str = "MB5"
     aimbot_fov: int = 150
     aimbot_smooth: float = 0.30
-    aimbot_target_offset: float = 90.0  # cm above capsule center (head)
+    aimbot_target_offset: float = 0.0  # 0 = lock on ESP dot; raise for head/chest
     aimbot_show_fov: bool = True
 
 
@@ -871,18 +858,14 @@ class Menu(QWidget):
         self.cb_names = self._chk("Show Names", "show_names")
         self.cb_dist = self._chk("Show Distance", "show_distance")
         self.cb_snap = self._chk("Snap Lines", "snap_lines")
-        self.cb_team = self._chk("Team Filter (Hunters)", "team_filter")
         self.cb_debug = self._chk("Show Debug Counters", "show_debug")
-        self.cb_all_chars = self._chk("Show ALL Characters", "show_all_chars")
         layout.addWidget(self.cb_enabled)
         layout.addWidget(self.cb_box)
         layout.addWidget(self.cb_local)
         layout.addWidget(self.cb_names)
         layout.addWidget(self.cb_dist)
         layout.addWidget(self.cb_snap)
-        layout.addWidget(self.cb_team)
         layout.addWidget(self.cb_debug)
-        layout.addWidget(self.cb_all_chars)
 
         dot_row = QHBoxLayout()
         dot_row.addWidget(QLabel("Dot Radius:"))
@@ -1127,9 +1110,7 @@ class Overlay(QWidget):
 
         count = 0
         for is_local, pos, idx in self.esp.iter_players(
-                include_local=self.config.show_local,
-                team_filter=self.config.team_filter,
-                show_all_chars=self.config.show_all_chars):
+                include_local=self.config.show_local):
             screen_info = self._project_dot(pos, cam, w, h)
             if not screen_info:
                 continue
@@ -1180,9 +1161,9 @@ class Overlay(QWidget):
             best_target = self._find_best_target(cam, w, h)
             key_held = self._aim_key_held()
             if self.config.show_debug:
-                print(f"[AIM-DEBUG] key_held={key_held} best_target={best_target}")
+                print(f"[AIM-DEBUG] key_held={key_held} best_target={best_target[0] if best_target else None}")
             if best_target and key_held:
-                self._aim_at(best_target)
+                self._aim_at(best_target[0], best_target[1])
 
     def _project_dot(self, center_pos, camera, screen_w, screen_h):
         # The actor's RootComponent relative location is already the capsule center,
@@ -1242,30 +1223,38 @@ class Overlay(QWidget):
 
         cx, cy = screen_w / 2, screen_h / 2
         cam_loc = camera["loc"]
+
+        # If we cannot identify the local player, do not silently aim at anyone
+        # (prevents locking onto our own body when controller resolution fails).
+        if not local_pawn:
+            if self.config.show_debug:
+                print("[AIM-DEBUG] local pawn not resolved; refusing to aim")
+            return None
+
         best_dist = float("inf")
         best_target = None
         count = 0
-        for is_local, pos, idx in self.esp.iter_players(
-                include_local=False,
-                team_filter=self.config.team_filter,
-                show_all_chars=self.config.show_all_chars):
+        for is_local, pos, idx in self.esp.iter_players(include_local=False, players_only=True):
             if is_local:
                 continue
-            # Skip self if it leaked through.
+            # Skip self if it leaked through. Use a generous threshold because
+            # third-person cameras can sit more than 50 cm from the capsule center.
             if local_pos:
                 dself = math.sqrt((pos[0] - local_pos[0]) ** 2 +
                                   (pos[1] - local_pos[1]) ** 2 +
                                   (pos[2] - local_pos[2]) ** 2)
-                if dself < 50.0:
+                if dself < 150.0:
                     continue
             # Skip anything right on top of the camera (failsafe for broken local filter).
             dcam = math.sqrt((pos[0] - cam_loc[0]) ** 2 +
                              (pos[1] - cam_loc[1]) ** 2 +
                              (pos[2] - cam_loc[2]) ** 2)
-            if dcam < 50.0:
+            if dcam < 100.0:
                 continue
             count += 1
 
+            # Aim at the same point the ESP dot is drawn, plus the user offset.
+            # Default offset is 0 so the crosshair lands on the dot.
             aim_pos = (pos[0], pos[1], pos[2] + self.config.aimbot_target_offset)
             s = w2s(aim_pos, camera, screen_w, screen_h)
             if not s:
@@ -1275,9 +1264,9 @@ class Overlay(QWidget):
             d = math.sqrt(dx * dx + dy * dy)
             if d <= self.config.aimbot_fov and d < best_dist:
                 best_dist = d
-                best_target = aim_pos
+                best_target = (aim_pos, camera)
         if self.config.show_debug:
-            print(f"[AIM-DEBUG] candidates={count} best_target={best_target} fov={self.config.aimbot_fov}")
+            print(f"[AIM-DEBUG] candidates={count} best_target={best_target[0] if best_target else None} fov={self.config.aimbot_fov}")
         return best_target
 
     def _vector_to_rotation(self, vec):
@@ -1319,22 +1308,21 @@ class Overlay(QWidget):
             print(f"[AIM-DEBUG] write ControlRotation={rot} ok={ok}")
         return ok
 
-    def _aim_at(self, target_pos):
-        cam = self.esp.get_camera()
-        if not cam:
+    def _aim_at(self, target_pos, camera):
+        if not camera:
             return
         current = self._read_control_rotation()
         if current is None:
             return
-        dx = target_pos[0] - cam["loc"][0]
-        dy = target_pos[1] - cam["loc"][1]
-        dz = target_pos[2] - cam["loc"][2]
+        dx = target_pos[0] - camera["loc"][0]
+        dy = target_pos[1] - camera["loc"][1]
+        dz = target_pos[2] - camera["loc"][2]
         target_rot = self._vector_to_rotation((dx, dy, dz))
         smooth = self.config.aimbot_smooth
         new_pitch = current[0] + (target_rot[0] - current[0]) * smooth
         new_yaw = current[1] + (target_rot[1] - current[1]) * smooth
         if self.config.show_debug:
-            print(f"[AIM-DEBUG] cam_loc={cam['loc']} target_pos={target_pos} current={current} target_rot={target_rot} new=({new_pitch}, {new_yaw})")
+            print(f"[AIM-DEBUG] cam_loc={camera['loc']} target_pos={target_pos} current={current} target_rot={target_rot} new=({new_pitch}, {new_yaw})")
         self._write_control_rotation((new_pitch, new_yaw, current[2]))
 
 
